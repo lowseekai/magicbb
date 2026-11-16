@@ -73,18 +73,26 @@ class Configure
         }
 
         if ($s('bb_hide_login')) {
-            $config->BBCodes->addCustom('[login]{TEXT}[/login]', '<div class="bb-hide bb-hide--login"><xsl:apply-templates/></div>');
+            $config->BBCodes->addCustom('[login]{TEXT}[/login]', $this->hideTemplate('login'));
         }
         if ($s('bb_hide_like')) {
-            $config->BBCodes->addCustom('[like]{TEXT}[/like]',   '<div class="bb-hide bb-hide--like"><xsl:apply-templates/></div>');
+            $config->BBCodes->addCustom('[like]{TEXT}[/like]', $this->hideTemplate('like'));
         }
         if ($s('bb_hide_reply')) {
-            $config->BBCodes->addCustom('[reply]{TEXT}[/reply]', '<div class="bb-hide bb-hide--reply"><xsl:apply-templates/></div>');
+            $config->BBCodes->addCustom('[reply]{TEXT}[/reply]', $this->hideTemplate('reply'));
         }
 
         if ($s('bb_anchor')) {
             $this->addAnchorBBCodes($config);
         }
+    }
+
+    protected function hideTemplate(string $kind): string
+    {
+        return '<div class="bb-hide bb-hide--' . $kind . '">'
+            . '<div class="bb-hide__head"><xsl:value-of select="@label"/></div>'
+            . '<div class="bb-hide__body"><xsl:apply-templates/></div>'
+            . '</div>';
     }
 
     protected function enableRawIframe(Configurator $config): void

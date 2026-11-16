@@ -35,57 +35,105 @@ class HideContent
             return $xml;
         }
 
-        // No request context (email notification rendering, CLI commands, queue
-        // jobs, …) means we can't identify an actor. Treat this conservatively as
-        // an unauthenticated/guest context rather than leaking the gated content.
-        if ($request === null) {
-            return $this->redactAsGuest($xml);
-        }
-
-        $actor = RequestUtil::getActor($request);
         $post  = $context;
+        $actor = $request ? RequestUtil::getActor($request) : null;
 
-        if ($actor->isGuest()) {
-            return $this->redactAsGuest($xml);
+        // No actor (email notifications, queue jobs, CLI) or a guest: treat as
+        // unauthenticated rather than leaking the gated content.
+        if ($actor === null || $actor->isGuest()) {
+            $hint = $this->translator->trans('forumaker-magicbb.forum.hide.login_to_see_simple');
+
+            $xml = $this->apply($xml, 'LOGIN', false, '登录可见', $hint);
+            $xml = $this->apply($xml, 'LIKE', false, '点赞可见', $hint);
+            $xml = $this->apply($xml, 'REPLY', false, '回复可见', $hint);
+
+            return $xml;
         }
-
-        $xml = $this->revealTag($xml, 'LOGIN');
 
         $isAuthor = (int) $actor->id === (int) $post->user_id;
+        $ownerTag = $isAuthor ? ' [作者可见]' : '';
+
+        // [LOGIN] — visible to every logged in user.
+        $xml = $this->apply($xml, 'LOGIN', true, '登录可见', '');
 
         if ($this->hasTag($xml, 'LIKE')) {
-            if ($isAuthor || $actor->hasPermission('post.bypasslikeRequirement')) {
-                $xml = $this->revealTag($xml, 'LIKE');
+            if ($isAuthor
+                || $actor->hasPermission('post.bypasslikeRequirement')
+                || $this->actorLikedPost($actor, $post)
+            ) {
+                $xml = $this->apply($xml, 'LIKE', true, '点赞可见' . $ownerTag, '');
             } else {
-                $liked = $this->actorLikedPost($actor, $post);
-                $xml   = $liked
-                    ? $this->revealTag($xml, 'LIKE')
-                    : $this->hideTag($xml, 'LIKE', $this->translator->trans('forumaker-magicbb.forum.hide.like_to_see_simple'));
+                $xml = $this->apply(
+                    $xml,
+                    'LIKE',
+                    false,
+                    '点赞可见',
+                    $this->translator->trans('forumaker-magicbb.forum.hide.like_to_see_simple')
+                );
             }
         }
 
         if ($this->hasTag($xml, 'REPLY')) {
-            if ($isAuthor || $actor->hasPermission('post.bypassreplyRequirement')) {
-                $xml = $this->revealTag($xml, 'REPLY');
+            if ($isAuthor
+                || $actor->hasPermission('post.bypassreplyRequirement')
+                || $this->actorHasReplied($actor, $post)
+            ) {
+                $xml = $this->apply($xml, 'REPLY', true, '回复可见' . $ownerTag, '');
             } else {
-                $replied = $this->actorHasReplied($actor, $post);
-                $xml     = $replied
-                    ? $this->revealTag($xml, 'REPLY')
-                    : $this->hideTag($xml, 'REPLY', $this->translator->trans('forumaker-magicbb.forum.hide.reply_to_see_simple'));
+                $xml = $this->apply(
+                    $xml,
+                    'REPLY',
+                    false,
+                    '回复可见',
+                    $this->translator->trans('forumaker-magicbb.forum.hide.reply_to_see_simple')
+                );
             }
         }
 
         return $xml;
     }
 
-    private function redactAsGuest(string $xml): string
+    /**
+     * Rewrite a <TAG> node in place.
+     *
+     * The tag is always kept (so the template can draw the dashed container),
+     * `label` carries the header text, and locked bodies are replaced by the
+     * hint message. The BBCode's <s>/<e> markers are dropped either way, which
+     * is what the previous reveal/hide helpers did implicitly.
+     */
+    private function apply(string $xml, string $tag, bool $unlocked, string $label, string $hint): string
     {
-        $msg = $this->translator->trans('forumaker-magicbb.forum.hide.login_to_see_simple');
-        $xml = $this->hideTag($xml, 'LOGIN', $msg);
-        $xml = $this->hideTag($xml, 'LIKE',  $msg);
-        $xml = $this->hideTag($xml, 'REPLY', $msg);
+        $pattern = '/<' . $tag . '>(?:<s>.*?<\/s>)?(.*?)(?:<e>.*?<\/e>)?<\/' . $tag . '>/si';
 
-        return $xml;
+        if (!preg_match($pattern, $xml)) {
+            return $xml;
+        }
+
+        $result = preg_replace_callback(
+            $pattern,
+            function (array $m) use ($tag, $unlocked, $label, $hint): string {
+                $body = $unlocked ? $m[1] : htmlspecialchars($hint, ENT_XML1);
+
+                return '<' . $tag . ' label="' . htmlspecialchars($label, ENT_XML1) . '">'
+                    . $body
+                    . '</' . $tag . '>';
+            },
+            $xml
+        );
+
+        return $result ?? $xml;
+    }
+
+    private function containsHideTags(string $xml): bool
+    {
+        return str_contains($xml, '<LOGIN')
+            || str_contains($xml, '<LIKE')
+            || str_contains($xml, '<REPLY');
+    }
+
+    private function hasTag(string $xml, string $tag): bool
+    {
+        return str_contains($xml, '<' . $tag);
     }
 
     private function actorLikedPost(User $actor, CommentPost $post): bool
@@ -141,36 +189,5 @@ class HideContent
         }
 
         return $this->repliedCache[$aid][$did];
-    }
-
-    private function containsHideTags(string $xml): bool
-    {
-        return str_contains($xml, '<LOGIN')
-            || str_contains($xml, '<LIKE')
-            || str_contains($xml, '<REPLY');
-    }
-
-    private function hasTag(string $xml, string $tag): bool
-    {
-        return str_contains($xml, '<' . $tag);
-    }
-
-    private function revealTag(string $xml, string $tag): string
-    {
-        return preg_replace(
-            '/<' . $tag . '>(?:<s>[^<]*<\/s>)?(.*?)(?:<e>[^<]*<\/e>)?<\/' . $tag . '>/si',
-            '$1',
-            $xml
-        ) ?? $xml;
-    }
-
-    private function hideTag(string $xml, string $tag, string $message): string
-    {
-        $escaped = htmlspecialchars($message, ENT_XML1);
-        return preg_replace(
-            '/<' . $tag . '>(?:<s>[^<]*<\/s>)?.*?(?:<e>[^<]*<\/e>)?<\/' . $tag . '>/si',
-            '<' . $tag . '>' . $escaped . '</' . $tag . '>',
-            $xml
-        ) ?? $xml;
     }
 }
