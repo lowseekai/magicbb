@@ -103,21 +103,110 @@ class HideContent
      */
     private function apply(string $xml, string $tag, bool $unlocked, string $label, string $hint): string
     {
-        $pattern = '/<' . $tag . '>(?:<s>.*?<\/s>)?(.*?)(?:<e>.*?<\/e>)?<\/' . $tag . '>/si';
-
-        if (!preg_match($pattern, $xml)) {
+        if (!str_contains($xml, '<' . $tag)) {
             return $xml;
         }
 
+        // Only the opening tag is touched for the label: the body is never
+        // rewritten by a regex that may cross tag boundaries. Such a pattern
+        // could silently truncate a long post's XML, and then the whole post
+        // failed to render (2026-11-16 incident on doingfb.com).
+        $xml = $this->labelTag($xml, $tag, $label);
+
+        if ($unlocked) {
+            return $xml;
+        }
+
+        return $this->emptyTagBodies($xml, $tag, $hint);
+    }
+
+    /**
+     * Add (or replace) the `label` attribute on every opening <TAG> tag.
+     * Attributes only — the node body is left exactly as s9e produced it.
+     */
+    private function labelTag(string $xml, string $tag, string $label): string
+    {
+        $escaped = htmlspecialchars($label, ENT_XML1 | ENT_QUOTES);
+        $pattern = '/<' . $tag . '(\s[^>]*)?>/i';
+
         $result = preg_replace_callback(
             $pattern,
-            function (array $m) use ($tag, $unlocked, $label, $hint): string {
-                $body = $unlocked ? $m[1] : htmlspecialchars($hint, ENT_XML1);
+            function (array $m) use ($tag, $escaped): string {
+                $attributes = $m[1] ?? '';
 
-                return '<' . $tag . ' label="' . htmlspecialchars($label, ENT_XML1) . '">'
-                    . $body
-                    . '</' . $tag . '>';
+                if (preg_match('/\slabel\s*=\s*"[^"]*"/i', $attributes)) {
+                    $attributes = preg_replace('/\slabel\s*=\s*"[^"]*"/i', ' label="' . $escaped . '"', $attributes);
+                } else {
+                    $attributes .= ' label="' . $escaped . '"';
+                }
+
+                return '<' . $tag . $attributes . '>';
             },
+            $xml
+        );
+
+        return $result ?? $xml;
+    }
+
+    /**
+     * Replace the body of every <TAG> node with the hint text.
+     *
+     * The DOM is used so nested tags, s9e <s>/<e> markers and repeated nodes
+     * are all handled exactly once, whatever their nesting depth. If the XML
+     * cannot be parsed the pre-existing, bounded rewrite is used as a fallback
+     * so a locked tag never ends up fully visible.
+     */
+    private function emptyTagBodies(string $xml, string $tag, string $hint): string
+    {
+        $previous = libxml_use_internal_errors(true);
+
+        $dom = new \DOMDocument();
+        $dom->preserveWhiteSpace = true;
+
+        if (!@$dom->loadXML($xml)) {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+
+            return $this->replaceNodeBody($xml, $tag, $hint);
+        }
+
+        $nodes = [];
+
+        foreach ((new \DOMXPath($dom))->query('//' . $tag) ?: [] as $node) {
+            $nodes[] = $node;
+        }
+
+        // Deepest first, so clearing a parent never leaves a stale child handle.
+        foreach (array_reverse($nodes) as $node) {
+            if (!$node->parentNode) {
+                continue;
+            }
+
+            while ($node->firstChild !== null) {
+                $node->removeChild($node->firstChild);
+            }
+
+            $node->appendChild($dom->createTextNode($hint));
+        }
+
+        $result = $dom->documentElement !== null ? $dom->saveXML($dom->documentElement) : $xml;
+
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+
+        return is_string($result) && $result !== '' ? $result : $xml;
+    }
+
+    /**
+     * Bounded fallback: matches the node with markers only, never across tags.
+     */
+    private function replaceNodeBody(string $xml, string $tag, string $hint): string
+    {
+        $escaped = htmlspecialchars($hint, ENT_XML1);
+
+        $result = preg_replace(
+            '/<' . $tag . '(\s[^>]*)?>(?:<s>[^<]*<\/s>)?(?:<e>[^<]*<\/e>)?<\/' . $tag . '>/si',
+            '<' . $tag . '$1>' . $escaped . '</' . $tag . '>',
             $xml
         );
 
